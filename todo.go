@@ -1,7 +1,30 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"flag"
+)
+
+var load bool
+var save bool
+
+func init() {
+	flag.BoolVar(&load, "load", false, "")
+	flag.BoolVar(&save, "save", false, "")
+}
 
 func main() {
-	fmt.Println("Hello world!")
+	flag.Parse()
+
+	if (load) {
+		print("should load")
+	}
+
+	if (save) {
+		print("should save")
+	}
+}
+
+func print(message string) {
+	fmt.Println(message)
 }
