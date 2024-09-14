@@ -5,12 +5,12 @@ import (
 	"os"
 	"io"
 	"time"
-	"bufio"
 	"strconv"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
+	"github.com/gdamore/tcell"
 )
 
 var git_repo *git.Repository
@@ -19,22 +19,96 @@ var git_worktree *git.Worktree
 var config Config
 var data Data
 
-// Action types
-type Action int
-const (
-	CreateTask = iota
-	RemoveTask = iota
-	CreateGoal = iota
-	RemoveGoal = iota
-	TallyMax = iota
-)
+var screen tcell.Screen
+var default_style tcell.Style
+
+var current_input_mode InputMode
 
 // Goal types
 type GoalType int
 const (
-	TallyGoal = iota
-	ElementsGoal = iota
+	TALLY = iota
+	ELEMENTS = iota
 )
+
+type InputMode int
+const (
+	MOTIONS_MODE = iota
+	PAGE_MODE = iota
+)
+
+type UIPageType int
+const (
+	HOME = iota
+	GOALS = iota
+	GOAL = iota
+	NEW_GOAL = iota
+)
+
+type NumericMotionDataType int
+const (
+	GOAL_NUMERIC = iota
+)
+
+type NumericMotionData struct {
+	data_type NumericMotionDataType
+	max_value int
+	value_entered int
+
+	goals []Goal
+}
+
+func new_goal_numeric_motion_data(goals []Goal) NumericMotionData {
+	return NumericMotionData{
+		data_type: GOAL_NUMERIC,
+		max_value: len(goals) - 1,
+		goals: goals,
+	}
+}
+
+type MotionType int
+const (
+	MNEMONIC = iota
+	NUMERIC = iota
+)
+
+type Motion struct {
+	motion_type MotionType
+	children []Motion
+	page UIPage
+
+	// Mnemonic
+	key rune
+
+	// Numeric
+	numeric_data NumericMotionData
+
+	// Input fields
+	input_fields []InputField
+}
+
+func new_mnemonic_motion(key_rune rune, children []Motion, page UIPage) Motion {
+	return Motion{
+		motion_type: MNEMONIC,
+		children: children,
+		page: page,
+		key: key_rune,
+	}
+}
+
+func new_numeric_motion(page UIPage, children []Motion, numeric_motion_data NumericMotionData) Motion {
+	return Motion{
+		motion_type: NUMERIC,
+		children: children,
+		page: page,
+		numeric_data: numeric_motion_data,
+	}
+}
+
+// TODO: Does this need to exist?
+type UIPage struct {
+	page_type UIPageType
+}
 
 type Config struct {
 	DataPath string
@@ -48,30 +122,6 @@ type Config struct {
 type Data struct {
 	Goals []Goal
 	Tasks []Task
-
-	GoalCounter int
-	TaskCounter int
-}
-
-type Command struct {
-	name string
-
-	requires_arg bool
-
-	// If the command is supposed to change a value
-	is_value_command bool
-	string_value *string
-	bool_value *bool
-
-	// If the command has an action tied to it
-	is_action_command bool
-	action Action
-
-	// If the command is a parent
-	children []Command
-
-	// If this parent command passes a value to is child
-	has_parent_value bool
 }
 
 type Tally struct {
@@ -86,282 +136,36 @@ type Element struct {
 
 type Goal struct {
 	Name string
-	Index int
 
 	GoalType GoalType
 	Tally Tally
 	Elements []Element
 }
 
+type InputType int
+const (
+	INT = iota
+	STRING = iota
+)
+
+type InputField struct {
+	name string
+	field_type InputType
+
+	int_value int
+	string_value string
+}
+
 type Task struct {
 	Name string
-	Index int
-}
-
-func new_parent_command(name string, children ...Command) Command {
-	return Command{
-		name: name,
-		children: children,
-		requires_arg: true,
-	}
-}
-
-func new_parent_value_command(name string, children ...Command) Command {
-	return Command{
-		name: name,
-		children: children,
-		requires_arg: true,
-		has_parent_value: true,
-	}
-}
-
-func new_string_value_command(name string, value *string) Command {
-	return Command{
-		name: name,
-		is_value_command: true,
-		requires_arg: true,
-		string_value: value,
-	}
-}
-
-func new_bool_value_command(name string, value *bool) Command {
-	return Command{
-		name: name,
-		is_value_command: true,
-		requires_arg: true,
-		bool_value: value,
-	}
-}
-
-func new_action_command(name string, action Action, requires_arg bool) Command {
-	return Command{
-		name: name,
-		is_action_command: true,
-		action: action,
-		requires_arg: requires_arg,
-	}
-}
-
-// parent_value: a value that might be passed down by parent
-func (command Command) process_command(args []string, parent_value string) {
-	// If no argument was passed
-	if len(args) == 0 && command.requires_arg {
-		// TODO: Print usage
-		print_error("Not enough arguments passed to \"" + command.name + "\"")
-		return
-	}
-
-	// If command is parent
-	if len(command.children) > 0 {
-		for _, child := range command.children {
-			child_arg_offset := 0
-
-			if child.has_parent_value {
-				child_arg_offset = 1
-				parent_value = args[0]
-			}
-
-			if child.name == args[child_arg_offset] {
-				child.process_command(args[child_arg_offset + 1:], parent_value)
-				return
-			}
-		}
-
-		// If no child matching the argument was found
-		print_error("Unknown command \"" + args[0] + "\" for \"" + command.name + "\"")
-		return
-	}
-
-	// If command has action
-	if len(args) == 0 {
-		args = append(args, "")
-	}
-
-	if command.is_action_command{
-		switch command.action {
-		case CreateTask: create_task(args[0])
-		case RemoveTask: remove_task(args[0])
-		case CreateGoal: create_goal()
-		case RemoveGoal: remove_goal(args[0])
-		case TallyMax: tally_max(parent_value, args[0])
-		}
-
-		return
-	}
-
-	// If command is value
-	if command.is_value_command {
-		// String value
-		if command.string_value != nil {
-			*command.string_value = args[0]
-		}
-
-		// Bool value
-		if command.bool_value != nil {
-			if args[0] == "off" {
-				*command.bool_value = false
-			} else if args[0] == "on" {
-				*command.bool_value = true
-			} else {
-				print_error("Value of \"" + command.name + "\" can only be either \"on\" or \"off\"")
-			}
-		}
-
-		return
-	}
-}
-
-func find_goal(index int) *Goal {
-	for i := range len(data.Goals) {
-		goal := &data.Goals[i]
-		if goal.Index == index {
-			return goal
-		}
-	}
-
-	panic("Unable to find goal " + strconv.Itoa(index))
-}
-
-func tally_max(goal_index_str string, argument string) {
-	goal_index, err := strconv.Atoi(goal_index_str)
-	if err != nil {
-		panic(err)
-	}
-
-	goal := find_goal(goal_index)
-
-	if goal.GoalType != TallyGoal {
-		fmt.Println("Goal", goal_index_str, "is not a tally goal")
-	}
-
-	if argument == "" {
-		fmt.Println("Tally Max for goal " + goal_index_str + " is set to " + strconv.Itoa(goal.Tally.Max))
-	} else {
-		new_max, err := strconv.Atoi(argument)
-		if err != nil {
-			panic(err)
-		}
-
-		goal.Tally.Max = new_max
-	}
 }
 
 func create_task(task_name string) {
-	index := data.TaskCounter
-	data.TaskCounter++
-
 	new_task := Task{
 		Name: task_name,
-		Index: index,
 	}
 
 	data.Tasks = append(data.Tasks, new_task)
-}
-
-func remove_task(task_num string) {
-	var index int
-	var found_task bool
-	for i, task := range(data.Tasks) {
-		if strconv.Itoa(task.Index) == task_num {
-			index = i
-			found_task = true
-			break
-		}
-	}
-
-	if !found_task {
-		print_error("Was unable to find task: \"" + task_num + "\"")
-		return
-	}
-
-	data.Tasks = append(data.Tasks[:index], data.Tasks[index + 1:]...)
-}
-
-func create_goal() {
-	name_input := InputVar{
-		name: "Name",
-		value_type: String,
-	}
-
-	type_input := InputVar{
-		name: "Goal type (0: tally, 1: elements)",
-		value_type: Int,
-	}
-
-	multivar_input(&name_input, &type_input)
-
-	if type_input.int_value > 1 {
-		print_error(strconv.Itoa(type_input.int_value) + " is not a valid value for Goal Type")
-		return
-	}
-
-	index := data.GoalCounter
-	data.GoalCounter++
-
-	new_goal := Goal{
-		Name: name_input.string_value,
-		Index: index,
-	}
-
-	data.Goals = append(data.Goals, new_goal)
-}
-
-func remove_goal(goal_index string) {
-	var index int
-	var found_goal bool
-	for i, goal := range(data.Goals) {
-		if strconv.Itoa(goal.Index) == goal_index {
-			index = i
-			found_goal = true
-			break
-		}
-	}
-
-	if !found_goal {
-		print_error("Was unable to find goal: \"" + goal_index + "\"")
-		return
-	}
-
-	data.Goals = append(data.Goals[:index], data.Goals[index + 1:]...)
-}
-
-type ValueType int
-const (
-	String = iota
-	Int = iota
-)
-
-type InputVar struct {
-	name string
-	value_type ValueType
-	string_value string
-	int_value int
-}
-
-// Prompts the user to enter multiple variables
-func multivar_input(variables ...*InputVar) {
-	reader := bufio.NewReader(os.Stdin)
-
-	for _, variable := range variables {
-		fmt.Print(variable.name + ": ")
-
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			panic(err)
-		}
-
-		switch variable.value_type {
-		case String:
-			(*variable).string_value = input[:len(input)-2]
-		case Int:
-			value, err := strconv.Atoi(input[:1])
-			if err != nil {
-				panic(err)
-			}
-
-			(*variable).int_value = value
-		}
-	}
 }
 
 func main() {
@@ -382,88 +186,212 @@ func main() {
 		defer write_data()
 	}
 
-	config_cmd := new_parent_command(
-		"config",
-		new_string_value_command(
-			"data_path",
-			&config.DataPath,
-		),
-		new_bool_value_command(
-			"debug",
-			&config.Debug,
-		),
-		new_parent_command(
-			"git",
-			new_string_value_command(
-				"username",
-				&config.GitUsername,
+	// Init tcell
+	new_screen, err := tcell.NewScreen()
+	if err != nil {
+		panic(err)
+	}
+	screen = new_screen
+
+	err = screen.Init()
+	if err != nil {
+		panic(err)
+	}
+
+	default_style = tcell.StyleDefault.Background(tcell.ColorDefault).Foreground(tcell.ColorDefault)
+	screen.SetStyle(default_style)
+
+	screen.Clear()
+
+	// Game loop
+	starting_motion := new_mnemonic_motion(
+		':',
+		[]Motion{
+			new_mnemonic_motion(
+				'g',
+				[]Motion{
+					new_numeric_motion(
+						UIPage{
+							GOAL,
+						},
+						[]Motion{
+						},
+						new_goal_numeric_motion_data(data.Goals),
+					),
+				},
+				UIPage{
+					GOALS,
+				},
 			),
-			new_string_value_command(
-				"mail",
-				&config.GitMail,
-			),
-			new_string_value_command(
-				"token",
-				&config.GitToken,
-			),
-		),
+		},
+		UIPage{
+			HOME,
+		},
 	)
 
-	task_cmd := new_parent_command(
-		"task",
-		new_action_command(
-			"new",
-			CreateTask,
-			true,
-		),
-		new_action_command(
-			"remove",
-			RemoveTask,
-			true,
-		),
-	)
+	motion_log := []Motion{ starting_motion }
 
-	goal_cmd := new_parent_command(
-		"goal",
-		new_action_command(
-			"new",
-			CreateGoal,
-			false,
-		),
-		new_action_command(
-			"remove",
-			RemoveGoal,
-			true,
-		),
-		new_parent_value_command(
-			"tally",
-			new_action_command(
-				"max",
-				TallyMax,
-				false,
-			),
-		),
-	)
+	quit := func() {
+		screen.Fini()
+		os.Exit(0)
+	}
 
-	if len(os.Args) == 1 {
-		print_tasks()
-		print_goals()
-	} else if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "config":
-			config_cmd.process_command(os.Args[2:], "")
-		case "task":
-			task_cmd.process_command(os.Args[2:], "")
-		case "goal":
-			goal_cmd.process_command(os.Args[2:], "")
+	for {
+		screen.Show()
+
+		event := screen.PollEvent()
+		switch event := event.(type) {
+		case *tcell.EventResize:
+			screen.Sync()
+		case *tcell.EventKey:
+			screen.Clear()
+			if event.Key() == tcell.KeyCtrlC {
+				quit()
+			}
+
+			switch current_input_mode {
+			case MOTIONS_MODE:
+				handle_motion_input(&motion_log, event)
+			case PAGE_MODE:
+				handle_page_input(event)
+			}
 		}
+
+		last_motion := motion_log[len(motion_log) - 1]
+
+		draw_motion_log(motion_log)
+		draw_page(last_motion)
+	}
+}
+
+func draw_page(motion Motion) {
+	switch motion.page.page_type {
+	case HOME:
+		draw_home()
+	case GOALS:
+		draw_goals()
+	case GOAL:
+		draw_goal(motion.numeric_data.goals[motion.numeric_data.value_entered])
+	case NEW_GOAL:
+		draw_new_goal()
+	default:
+		draw_text(0, 1, "No page")
+	}
+}
+
+func draw_motion_log(motion_log []Motion) {
+	col := 0
+	for _, motion := range(motion_log) {
+		switch motion.motion_type {
+			case MNEMONIC:
+				screen.SetContent(col, 0, motion.key, nil, default_style)
+			case NUMERIC:
+				screen.SetContent(col, 0, rune(motion.numeric_data.value_entered + '0'), nil, default_style)
+		}
+
+		col++
+	}
+}
+
+func draw_home() {
+	draw_text(0, 1, "Home")
+	draw_text(0, 3, "Motions:")
+	draw_text(0, 4, "g: all goals")
+}
+
+func draw_goals() {
+	draw_text(0, 1, "Goals:")
+
+	for index, goal := range(data.Goals) {
+		draw_text(0, 1 + index, "%d: %s", index, goal.Name)
+	}
+}
+
+func draw_goal(goal Goal) {
+	draw_text(0, 1, "Name: %s", goal.Name)
+}
+
+func draw_new_goal() {
+}
+
+func handle_motion_input(motion_log *[]Motion, key_event *tcell.EventKey) {
+	// Handle switching focus
+	if key_event.Key() == tcell.KeyEscape {
+		current_input_mode = PAGE_MODE
+		return
+	}
+
+	// Handle backspace
+	if key_event.Key() == tcell.KeyBackspace {
+		if len(*motion_log) == 1 {
+			return
+		}
+
+		*motion_log = (*motion_log)[:len(*motion_log) - 1]
+		return
+	}
+
+	// Handle operators
+	if key_event.Rune() == '+' {
+	}
+
+	// Handle motions
+	last_motion := (*motion_log)[len(*motion_log) - 1]
+
+	// Handle numeric motion
+	num_value, err := strconv.Atoi(string(key_event.Rune()))
+	// If the key pressed was a numeric
+	if err == nil {
+		// Look for numeric child
+		var numeric_motion Motion
+		found_numeric_motion := false
+		for _, child := range(last_motion.children) {
+			if child.motion_type == NUMERIC {
+				numeric_motion = child
+				found_numeric_motion = true
+			}
+		}
+
+		if found_numeric_motion {
+			if num_value > numeric_motion.numeric_data.max_value {
+				return
+			}
+
+			switch numeric_motion.numeric_data.data_type {
+				case GOAL_NUMERIC:
+					numeric_motion.numeric_data.value_entered = num_value
+					*motion_log = append(*motion_log, numeric_motion)
+			}
+		}
+
+		return
+	}
+
+	// Look for mnemonic child
+	key_rune := key_event.Rune()
+	for _, child := range(last_motion.children) {
+		if child.key == key_rune {
+			*motion_log = append(*motion_log, child)
+			return
+		}
+	}
+}
+
+func handle_page_input(key_event *tcell.EventKey) {
+}
+
+func draw_text(x int, y int, format string, args ...interface{}) {
+	formatted_string := fmt.Sprintf(format, args...)
+
+	for index, r := range[]rune(formatted_string) {
+		screen.SetContent(x + index, y, r, nil, default_style)
 	}
 }
 
 func print_tasks() {
 	fmt.Println("Tasks:")
 	for _, task := range(data.Tasks) {
-		fmt.Println(strconv.Itoa(task.Index) + ": " + task.Name)
+		fmt.Println(task.Name)
 	}
 }
 
@@ -471,7 +399,7 @@ func print_goals() {
 	fmt.Println("Goals:")
 	for _, goal := range(data.Goals) {
 		switch goal.GoalType {
-		case ElementsGoal:
+		case ELEMENTS:
 			var progress int
 			for _, element := range(goal.Elements) {
 				if element.IsDone {
@@ -479,9 +407,9 @@ func print_goals() {
 				}
 			}
 
-			fmt.Println(strconv.Itoa(goal.Index) + ": " + goal.Name + " [" + strconv.Itoa(progress) + "/" + strconv.Itoa(len(goal.Elements)) + "]")
-		case TallyGoal:
-			fmt.Println(strconv.Itoa(goal.Index) + ": " + goal.Name + " [" + strconv.Itoa(goal.Tally.Progress) + "/" + strconv.Itoa(goal.Tally.Max) + "]")
+			fmt.Println(goal.Name + " [" + strconv.Itoa(progress) + "/" + strconv.Itoa(len(goal.Elements)) + "]")
+		case TALLY:
+			fmt.Println(goal.Name + " [" + strconv.Itoa(goal.Tally.Progress) + "/" + strconv.Itoa(goal.Tally.Max) + "]")
 		}
 	}
 }
@@ -651,11 +579,13 @@ func check_git(path string) bool {
 }
 
 func print_debug(args ...interface{}) {
+	/*
 	fmt.Printf("\u001b[90m")
 	if config.Debug {
 		fmt.Println(args...)
 	}
 	fmt.Printf("\u001b[37m")
+	*/
 }
 
 func print_error(args ...interface{}) {
