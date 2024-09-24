@@ -6,6 +6,7 @@ import (
 	"io"
 	"time"
 	"strconv"
+	"unicode"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -23,9 +24,12 @@ var screen tcell.Screen
 var default_style tcell.Style
 
 var current_input_mode InputMode
+var current_input_field_index int
+
+var motion_log []Motion
 
 // Goal types
-type GoalType int
+type GoalType = int
 const (
 	TALLY = iota
 	ELEMENTS = iota
@@ -52,16 +56,14 @@ const (
 
 type NumericMotionData struct {
 	data_type NumericMotionDataType
-	max_value int
 	value_entered int
 
-	goals []Goal
+	goals *[]Goal
 }
 
-func new_goal_numeric_motion_data(goals []Goal) NumericMotionData {
+func new_goal_numeric_motion_data(goals *[]Goal) NumericMotionData {
 	return NumericMotionData{
 		data_type: GOAL_NUMERIC,
-		max_value: len(goals) - 1,
 		goals: goals,
 	}
 }
@@ -82,9 +84,6 @@ type Motion struct {
 
 	// Numeric
 	numeric_data NumericMotionData
-
-	// Input fields
-	input_fields []InputField
 }
 
 func new_mnemonic_motion(key_rune rune, children []Motion, page UIPage) Motion {
@@ -105,9 +104,9 @@ func new_numeric_motion(page UIPage, children []Motion, numeric_motion_data Nume
 	}
 }
 
-// TODO: Does this need to exist?
 type UIPage struct {
 	page_type UIPageType
+	form Form
 }
 
 type Config struct {
@@ -152,8 +151,61 @@ type InputField struct {
 	name string
 	field_type InputType
 
-	int_value int
-	string_value string
+	int_value *int
+	int_max int
+
+	string_value *string
+}
+
+type Form interface {
+	GetFields() *[]InputField
+	Confirm()
+}
+
+type GoalForm struct {
+	input_fields []InputField
+	goal *Goal
+}
+
+func (goal_form GoalForm) GetFields() *[]InputField {
+	return &goal_form.input_fields
+}
+
+func (goal_form GoalForm) Confirm() {
+	data.Goals = append(data.Goals, *goal_form.goal)
+	*goal_form.goal = Goal{}
+}
+
+func new_goal_form() GoalForm {
+	goal:= &Goal{}
+
+	return GoalForm{
+		[]InputField{
+			new_string_input_field("Name", &goal.Name),
+			new_int_input_field("Type", &goal.GoalType, 1),
+		},
+		goal,
+	}
+}
+
+func new_int_input_field(name string, value *int, max_value int) InputField {
+	return InputField{
+		name,
+		INT,
+		value,
+		0,
+		nil,
+	}
+}
+
+func new_string_input_field(name string, value *string) InputField {
+	return InputField{
+		name,
+		STRING,
+		nil,
+		0,
+		value,
+	}
 }
 
 type Task struct {
@@ -203,7 +255,28 @@ func main() {
 
 	screen.Clear()
 
-	// Game loop
+	// Set up pages
+	home_page := UIPage{
+		HOME,
+		nil,
+	}
+
+	goals_page := UIPage{
+		GOALS,
+		nil,
+	}
+
+	goal_page := UIPage{
+		GOAL,
+		nil,
+	}
+
+	new_goal_page := UIPage{
+		NEW_GOAL,
+		new_goal_form(),
+	}
+
+	// Set up motions
 	starting_motion := new_mnemonic_motion(
 		':',
 		[]Motion{
@@ -211,32 +284,28 @@ func main() {
 				'g',
 				[]Motion{
 					new_numeric_motion(
-						UIPage{
-							GOAL,
-						},
-						[]Motion{
-						},
-						new_goal_numeric_motion_data(data.Goals),
+						goal_page,
+						[]Motion{},
+						new_goal_numeric_motion_data(&data.Goals),
+					),
+					new_mnemonic_motion(
+						'+',
+						[]Motion{},
+						new_goal_page,
 					),
 				},
-				UIPage{
-					GOALS,
-				},
+				goals_page,
 			),
 		},
-		UIPage{
-			HOME,
-		},
+		home_page,
 	)
 
-	motion_log := []Motion{ starting_motion }
 
-	quit := func() {
-		screen.Fini()
-		os.Exit(0)
-	}
+	motion_log = []Motion{ starting_motion }
 
-	for {
+	// Game loop
+	running := true
+	for running {
 		screen.Show()
 
 		event := screen.PollEvent()
@@ -246,15 +315,22 @@ func main() {
 		case *tcell.EventKey:
 			screen.Clear()
 			if event.Key() == tcell.KeyCtrlC {
-				quit()
+				running = false
 			}
 
 			switch current_input_mode {
 			case MOTIONS_MODE:
 				handle_motion_input(&motion_log, event)
 			case PAGE_MODE:
-				handle_page_input(event)
+				current_page := motion_log[len(motion_log) - 1].page
+				handle_page_input(event, &current_page.form)
 			}
+		}
+
+		if current_input_mode == MOTIONS_MODE {
+			screen.ShowCursor(len(motion_log), 0)
+		} else {
+			screen.HideCursor()
 		}
 
 		last_motion := motion_log[len(motion_log) - 1]
@@ -262,20 +338,23 @@ func main() {
 		draw_motion_log(motion_log)
 		draw_page(last_motion)
 	}
+
+	screen.Fini()
 }
 
 func draw_page(motion Motion) {
+	// TODO: Delete this whole switch and just store all the "ui components" inside the pages (like how forms work)
 	switch motion.page.page_type {
 	case HOME:
 		draw_home()
 	case GOALS:
 		draw_goals()
 	case GOAL:
-		draw_goal(motion.numeric_data.goals[motion.numeric_data.value_entered])
+		draw_goal((*motion.numeric_data.goals)[motion.numeric_data.value_entered])
 	case NEW_GOAL:
-		draw_new_goal()
+		draw_new_goal(*motion.page.form.GetFields())
 	default:
-		draw_text(0, 1, "No page")
+		draw_text(0, 1, default_style, "No page")
 	}
 }
 
@@ -294,32 +373,54 @@ func draw_motion_log(motion_log []Motion) {
 }
 
 func draw_home() {
-	draw_text(0, 1, "Home")
-	draw_text(0, 3, "Motions:")
-	draw_text(0, 4, "g: all goals")
+	draw_text(0, 1, default_style, "Home")
+	draw_text(0, 3, default_style, "Motions:")
+	draw_text(0, 4, default_style, "g: all goals")
 }
 
 func draw_goals() {
-	draw_text(0, 1, "Goals:")
+	draw_text(0, 1, default_style, "Goals:")
 
 	for index, goal := range(data.Goals) {
-		draw_text(0, 1 + index, "%d: %s", index, goal.Name)
+		draw_text(0, 1 + index, default_style, "%d: %s", index, goal.Name)
 	}
 }
 
 func draw_goal(goal Goal) {
-	draw_text(0, 1, "Name: %s", goal.Name)
+	draw_text(0, 1, default_style, "Name: %s", goal.Name)
 }
 
-func draw_new_goal() {
+func draw_new_goal(input_fields []InputField) {
+	draw_input_fields(input_fields)
+}
+
+func draw_input_fields(input_fields []InputField) {
+	for i, input_field := range(input_fields) {
+		is_highlighted := false
+
+		if current_input_field_index == i && current_input_mode == PAGE_MODE {
+			is_highlighted = true
+		}
+
+		switch input_field.field_type {
+		case INT:
+			draw_text(0, 1 + i, default_style.Reverse(is_highlighted), "%s: %d", input_field.name, *input_field.int_value)
+		case STRING:
+			draw_text(0, 1 + i, default_style.Reverse(is_highlighted), "%s: %s", input_field.name, *input_field.string_value)
+		}
+
+		screen.SetStyle(default_style)
+	}
 }
 
 func handle_motion_input(motion_log *[]Motion, key_event *tcell.EventKey) {
 	// Handle switching focus
-	if key_event.Key() == tcell.KeyEscape {
+	if key_event.Key() == tcell.KeyEnter {
 		current_input_mode = PAGE_MODE
 		return
 	}
+
+	current_input_field_index = 0
 
 	// Handle backspace
 	if key_event.Key() == tcell.KeyBackspace {
@@ -329,10 +430,6 @@ func handle_motion_input(motion_log *[]Motion, key_event *tcell.EventKey) {
 
 		*motion_log = (*motion_log)[:len(*motion_log) - 1]
 		return
-	}
-
-	// Handle operators
-	if key_event.Rune() == '+' {
 	}
 
 	// Handle motions
@@ -353,7 +450,7 @@ func handle_motion_input(motion_log *[]Motion, key_event *tcell.EventKey) {
 		}
 
 		if found_numeric_motion {
-			if num_value > numeric_motion.numeric_data.max_value {
+			if num_value >= len(*numeric_motion.numeric_data.goals) {
 				return
 			}
 
@@ -377,40 +474,75 @@ func handle_motion_input(motion_log *[]Motion, key_event *tcell.EventKey) {
 	}
 }
 
-func handle_page_input(key_event *tcell.EventKey) {
+func handle_page_input(key_event *tcell.EventKey, form *Form) {
+	// Handle switching focus
+	if key_event.Key() == tcell.KeyEscape {
+		current_input_mode = MOTIONS_MODE
+		return
+	}
+
+	if key_event.Key() == tcell.KeyUp && current_input_field_index == 0 {
+		current_input_mode = MOTIONS_MODE
+		return
+	}
+
+	if form == nil {
+		return
+	}
+
+	input_fields := (*form).GetFields()
+
+	if len(*input_fields) == 0 {
+		return
+	}
+
+	// Handle confirming inputs
+	if key_event.Key() == tcell.KeyEnter && current_input_field_index == len(*input_fields) - 1 {
+		(*form).Confirm()
+
+		// Exit page
+		motion_log = motion_log[:len(motion_log) - 1]
+		current_input_mode = MOTIONS_MODE
+
+		return
+	}
+
+	// Handle switching between fields
+	if key_event.Key() == tcell.KeyDown || key_event.Key() == tcell.KeyEnter {
+		current_input_field_index = min(current_input_field_index + 1, len(*input_fields) - 1)
+		return
+	}
+
+	if key_event.Key() == tcell.KeyUp {
+		current_input_field_index = max(current_input_field_index - 1, 0)
+		return
+	}
+
+	// Handle entering values into fields
+	current_input_field := &(*input_fields)[current_input_field_index]
+	switch current_input_field.field_type {
+	case INT:
+		input := key_event.Rune()
+		if unicode.IsDigit(input) {
+			*current_input_field.int_value *= 10
+			value, _ := strconv.Atoi(string(input))
+			*current_input_field.int_value += value
+		}
+	case STRING:
+		input := key_event.Rune()
+		if unicode.IsLetter(input) {
+			*current_input_field.string_value += string(input)
+		}
+	}
+
+	// TODO: Add the ability to erase
 }
 
-func draw_text(x int, y int, format string, args ...interface{}) {
+func draw_text(x int, y int, style tcell.Style, format string, args ...interface{}) {
 	formatted_string := fmt.Sprintf(format, args...)
 
 	for index, r := range[]rune(formatted_string) {
-		screen.SetContent(x + index, y, r, nil, default_style)
-	}
-}
-
-func print_tasks() {
-	fmt.Println("Tasks:")
-	for _, task := range(data.Tasks) {
-		fmt.Println(task.Name)
-	}
-}
-
-func print_goals() {
-	fmt.Println("Goals:")
-	for _, goal := range(data.Goals) {
-		switch goal.GoalType {
-		case ELEMENTS:
-			var progress int
-			for _, element := range(goal.Elements) {
-				if element.IsDone {
-					progress++
-				}
-			}
-
-			fmt.Println(goal.Name + " [" + strconv.Itoa(progress) + "/" + strconv.Itoa(len(goal.Elements)) + "]")
-		case TALLY:
-			fmt.Println(goal.Name + " [" + strconv.Itoa(goal.Tally.Progress) + "/" + strconv.Itoa(goal.Tally.Max) + "]")
-		}
+		screen.SetContent(x + index, y, r, nil, style)
 	}
 }
 
@@ -578,16 +710,11 @@ func check_git(path string) bool {
 	return true
 }
 
-func print_debug(args ...interface{}) {
-	/*
-	fmt.Printf("\u001b[90m")
-	if config.Debug {
-		fmt.Println(args...)
-	}
-	fmt.Printf("\u001b[37m")
-	*/
+// TODO: Remove this
+func print_debug(message ...interface{}) {
 }
 
-func print_error(args ...interface{}) {
-	fmt.Println(args...)
+func draw_debug_value(format string, args ...interface{}) {
+	_, height := screen.Size()
+	draw_text(0, height - 1, default_style, format, args...)
 }
